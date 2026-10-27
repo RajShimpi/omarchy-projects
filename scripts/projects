@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Projects helper for the Projects bar panel.
+
+  projects list                    -> JSON: every git repo under the roots, with its status
+  projects fetch [--quiet]         -> git fetch every repo (in parallel), then list; notifies
+                                      a summary unless --quiet
+  projects open <path>             -> open the project in the editor (+ a terminal there)
+  projects editor <path>           -> open the project in the editor only
+  projects term <path>             -> open a terminal in the project
+  projects dev <path>              -> open a terminal there running the project's dev command
+  projects branches <path>         -> JSON: local branches of one repo, most recent first
+  projects extras                  -> JSON: local branches and recently touched files of every repo
+  projects pull <path>             -> git pull --ff-only (notifies the result)
+  projects switch <path> <branch>  -> git switch, refused when tracked files have changes
+  projects settings                -> create the settings file with defaults, open it
+
+Settings: ~/.config/omarchy/projects.json (or $PROJECTS_CONFIG). See README.md.
+Set OMARCHY_NO_NOTIFY=1 to print notifications instead of sending them.
+"""
+import json, os, re, shlex, shutil, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("PROJECTS_CONFIG") or os.path.join(HOME, ".config/omarchy/projects.json")
+DEFAULTS = {
+    "roots": ["~/Projects", "~/projects", "~/Code", "~/code", "~/src", "~/dev", "~/Work", "~/work"],
+    "depth": 2,
+    "repos": [],
+    "exclude": [],
+    "editor": "omarchy-launch-editor",
+    "terminal": "xdg-terminal-exec",
+    "openTerminal": True,
+    "projects": {},
+}
+SKIP_DIRS = {"node_modules", "vendor", "venv", ".venv", "__pycache__", "target", "dist", "build"}
+GIT_ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+TUI_EDITORS = {"nvim", "vim", "vi", "nano", "micro", "hx", "helix", "kak", "emacs", "fresh"}
+# Terminal -> (args that set the working directory, args that come before a command).
+TERMINALS = {
+    "xdg-terminal-exec": (["--dir={dir}"], []),
+    "ghostty": (["--working-directory={dir}"], ["-e"]),
+    "alacritty": (["--working-directory", "{dir}"], ["-e"]),
+    "kitty": (["--directory", "{dir}"], []),
+    "foot": (["--working-directory={dir}"], []),
+    "wezterm": (["start", "--cwd", "{dir}"], ["--"]),
+    "konsole": (["--workdir", "{dir}"], ["-e"]),
+    "gnome-terminal": (["--working-directory={dir}"], ["--"]),
+    "xterm": ([], ["-e"]),
+}
+
+
+# ---------- basics ----------
+
+def settings():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            s.update(user)
+        else:
+            s["_error"] = f"{CONF}: expected a JSON object"
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        s["_error"] = f"{CONF}: {e}"
+    return s
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def notify(title, body=""):
+    if os.environ.get("OMARCHY_NO_NOTIFY") == "1" or not shutil.which("omarchy-notification-send"):
+        print(f"[notify] {title}" + (f" — {body}" if body else ""), file=sys.stderr)
+        return
+    subprocess.Popen(["omarchy-notification-send", "-g", "\U000f02a2", title, body],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def git(path, *args, timeout=20, env=None):
+    """(ok, stdout, stderr) — never raises."""
+    # Never let a broken repo fall through to a parent folder's repository.
+    env = dict(env or GIT_ENV, GIT_CEILING_DIRECTORIES=os.path.dirname(os.path.abspath(path)))
+    try:
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=timeout,
+                           env=env, stdin=subprocess.DEVNULL)
+        return r.returncode == 0, r.stdout, r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "", f"git {args[0]} timed out after {timeout}s"
+    except OSError as e:
+        return False, "", str(e)
+
+
+def last_line(text, fallback=""):
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return lines[-1] if lines else fallback
+
+
+def git_error(text, fallback):
+    """The line of git's stderr that says what went wrong."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    for rx in (r"Permission denied|Could not resolve|Connection (refused|timed out)|timed out|"
+               r"Authentication failed|not found|does not exist|Host key verification failed|"
+               r"terminal prompts disabled|could not read Username",
+               r"^(fatal|error):"):
+        for l in lines:
+            if re.search(rx, l, re.I):
+                return redact(re.sub(r"^(fatal|error):\s*", "", l))
+    return redact(lines[-1]) if lines else fallback
+
+
+def redact(text):
+    return re.sub(r"(\w+://[^/\s:@]+:)[^@\s/]+@", r"\1***@", text)
+
+
+def expand(p):
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(str(p))))
+
+
+def is_repo(p):
+    return os.path.exists(os.path.join(p, ".git"))
+
+
+def git_dirs(path):
+    """(gitdir, commondir) without running git; handles worktrees (.git is a file)."""
+    g = os.path.join(path, ".git")
+    if os.path.isfile(g):
+        try:
+            with open(g) as f:
+                line = f.read().strip()
+            if line.startswith("gitdir:"):
+                g = os.path.normpath(os.path.join(path, line[7:].strip()))
+        except OSError:
+            pass
+    common = g
+    try:
+        with open(os.path.join(g, "commondir")) as f:
+            common = os.path.normpath(os.path.join(g, f.read().strip()))
+    except OSError:
+        pass
+    return g, common
+
+
+def mtime(p):
+    try:
+        return int(os.path.getmtime(p))
+    except OSError:
+        return 0
+
+
+# ---------- finding repos ----------
+
+def excluded(path, s):
+    name = os.path.basename(path)
+    for x in s.get("exclude") or []:
+        x = str(x)
+        if x == name or ("/" in x and expand(x) == path):
+            return True
+    return False
+
+
+def find_repos(s):
+    """Repos under each root, descending into plain folders up to `depth` levels."""
+    try:
+        depth = max(1, min(4, int(s.get("depth", 2))))
+    except (TypeError, ValueError):
+        depth = 2
+    repos, seen = [], set()
+
+    def add(p):
+        real = os.path.realpath(p)
+        if real not in seen and not excluded(p, s):
+            seen.add(real)
+            repos.append(p)
+
+    def walk(d, level):
+        try:
+            names = sorted(os.listdir(d), key=str.lower)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(".") or name in SKIP_DIRS:
+                continue
+            p = os.path.join(d, name)
+            if not os.path.isdir(p):
+                continue
+            if is_repo(p):
+                add(p)
+            elif level < depth:
+                walk(p, level + 1)
+
+    for root in s.get("roots") or []:
+        root = expand(root)
+        if os.path.isdir(root):
+            if is_repo(root):
+                add(root)
+            else:
+                walk(root, 1)
+    for p in s.get("repos") or []:
+        p = expand(p)
+        if os.path.isdir(p) and is_repo(p):
+            add(p)
+    return repos
+
+
+def check_repo(path):
+    path = expand(path)
+    if not os.path.isdir(path):
+        out({"error": f"Not a folder: {path}"}, 1)
+    if not is_repo(path):
+        out({"error": f"Not a git repository: {path}"}, 1)
+    return path
+
+
+# ---------- status ----------
+
+def web_url(remote):
+    """https:// page of a remote, without credentials; "" for local or unknown remotes."""
+    remote = remote.strip()
+    m = re.match(r"^(?:ssh|git\+ssh)://(?:[^@/]+@)?([^:/]+)(?::\d+)?/(.+?)(?:\.git)?/?$", remote) \
+        or re.match(r"^git://([^:/]+)(?::\d+)?/(.+?)(?:\.git)?/?$", remote) \
+        or re.match(r"^[\w.-]+@([^:/]+):(?!/)(.+?)(?:\.git)?/?$", remote) \
+        or re.match(r"^https?://(?:[^@/]+@)?([^/]+)/(.+?)(?:\.git)?/?$", remote)
+    if not m:
+        m = re.match(r"^([\w-]+(?:\.[\w-]+)+):(?!/)(.+?)(?:\.git)?/?$", remote)   # host.tld:group/repo
+    return f"https://{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def project_conf(path, s):
+    p = s.get("projects") or {}
+    tilde = "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+    for key in (path, tilde, os.path.basename(path)):
+        if isinstance(p.get(key), dict):
+            return p[key]
+    return {}
+
+
+def dev_command(path, s):
+    conf = project_conf(path, s)
+    if "dev" in conf and conf["dev"]:
+        return str(conf["dev"])
+    has = lambda f: os.path.exists(os.path.join(path, f))
+    if has("package.json"):
+        try:
+            with open(os.path.join(path, "package.json")) as f:
+                scripts = json.load(f).get("scripts") or {}
+        except (OSError, ValueError, AttributeError):
+            scripts = {}
+        runner = ("bun run" if has("bun.lockb") or has("bun.lock") else "pnpm" if has("pnpm-lock.yaml")
+                  else "yarn" if has("yarn.lock") else "npm run")
+        for key in ("dev", "start", "serve"):
+            if key in scripts:
+                return f"{runner} {key}"
+    for f in ("deno.json", "deno.jsonc"):
+        if has(f):
+            try:
+                with open(os.path.join(path, f)) as fh:
+                    if "dev" in (json.loads(re.sub(r"^\s*//.*$", "", fh.read(), flags=re.M)).get("tasks") or {}):
+                        return "deno task dev"
+            except (OSError, ValueError, AttributeError):
+                pass
+    if has("bin/dev"):
+        return "bin/dev"
+    for f in ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"):
+        if has(f):
+            return "docker compose up"
+    if has("manage.py"):
+        return "python manage.py runserver"
+    if has("artisan"):
+        return "php artisan serve"
+    return ""
+
+
+def status(path, s):
+    gitdir, common = git_dirs(path)
+    r = {
+        "name": os.path.basename(path), "path": path, "group": os.path.basename(os.path.dirname(path)),
+        "branch": "", "upstream": "", "ahead": 0, "behind": 0,
+        "staged": 0, "modified": 0, "untracked": 0, "conflicts": 0, "stashes": 0, "changes": 0,
+        "lastCommit": 0, "lastSubject": "", "fetchedAt": mtime(os.path.join(common, "FETCH_HEAD")),
+        "web": "", "dev": dev_command(path, s),
+        "head": "", "detached": False, "unborn": False, "upstreamGone": False, "remotes": 0,
+        "worktree": os.path.isfile(os.path.join(path, ".git")), "activity": 0, "error": "",
+    }
+    ok, text, err = git(path, "status", "--porcelain=v2", "--branch", "--show-stash")
+    if not ok:
+        r["error"] = git_error(err, "git status failed")
+        return r
+    has_ab = False
+    for line in text.splitlines():
+        if line.startswith("# branch.oid "):
+            oid = line.split(" ", 2)[2]
+            r["unborn"] = oid == "(initial)"
+            r["head"] = "" if r["unborn"] else oid[:8]
+        elif line.startswith("# branch.head "):
+            r["branch"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.upstream "):
+            r["upstream"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.ab "):
+            a, b = line.split()[2:4]
+            r["ahead"], r["behind"], has_ab = int(a), abs(int(b)), True
+        elif line.startswith("# stash "):
+            r["stashes"] = int(line.split()[2])
+        elif line.startswith(("1 ", "2 ")):
+            xy = line.split(" ", 2)[1]
+            r["staged"] += xy[0] != "."
+            r["modified"] += xy[1] != "."
+        elif line.startswith("u "):
+            r["conflicts"] += 1
+        elif line.startswith("? "):
+            r["untracked"] += 1
+    r["detached"] = r["branch"] == "(detached)"
+    r["upstreamGone"] = bool(r["upstream"]) and not has_ab
+    r["changes"] = r["staged"] + r["modified"] + r["untracked"] + r["conflicts"]
+
+    if not r["unborn"]:
+        ok, text, _ = git(path, "log", "-1", "--format=%ct%x09%s")
+        ct, _, subject = text.strip().partition("\t")
+        if ok and ct.isdigit():
+            r["lastCommit"], r["lastSubject"] = int(ct), subject
+
+    ok, text, _ = git(path, "config", "--get-regexp", r"^remote\..*\.url$")
+    remotes = {}
+    for line in text.splitlines():
+        key, _, url = line.partition(" ")
+        remotes[key[len("remote."):-len(".url")]] = url
+    r["remotes"] = len(remotes)
+    pick = r["upstream"].split("/", 1)[0] if r["upstream"] else ""
+    url = remotes.get(pick) or remotes.get("origin") or (next(iter(remotes.values())) if remotes else "")
+    r["web"] = web_url(url)
+    # Last time anyone worked here: a commit, a checkout, staging (index), a fetch.
+    r["activity"] = max(r["lastCommit"], mtime(os.path.join(gitdir, "index")), mtime(os.path.join(gitdir, "logs", "HEAD")),
+                        mtime(os.path.join(gitdir, "HEAD")))
+    return r
+
+
+def safe_status(path, s):
+    try:
+        return status(path, s)
+    except Exception as e:  # one broken repo must not hide the others
+        return {"name": os.path.basename(path), "path": path, "group": os.path.basename(os.path.dirname(path)),
+                "branch": "", "upstream": "", "ahead": 0, "behind": 0, "staged": 0, "modified": 0,
+                "untracked": 0, "conflicts": 0, "stashes": 0, "changes": 0, "lastCommit": 0, "lastSubject": "",
+                "fetchedAt": 0, "web": "", "dev": "", "head": "", "detached": False, "unborn": False,
+                "upstreamGone": False, "remotes": 0, "worktree": False, "activity": 0, "error": str(e)}
+
+
+def repos_status(s):
+    paths = find_repos(s)
+    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 2) * 2)) as pool:
+        repos = list(pool.map(lambda p: safe_status(p, s), paths))
+    repos.sort(key=lambda r: (-r["activity"], r["name"].lower()))
+    return repos
+
+
+def listing(s, extra=None):
+    res = {"repos": repos_status(s), "at": int(time.time()), "config": CONF}
+    if s.get("_error"):
+        res["error"] = "Settings ignored — " + s["_error"]
+    elif not res["repos"]:
+        roots = ", ".join(str(r) for r in (s.get("roots") or [])) or "(none)"
+        res["error"] = f"No git repositories found under {roots}. Set \"roots\" in {CONF}."
+    if extra:
+        res.update(extra)
+    return res
+
+
+def cmd_list():
+    out(listing(settings()))
+
+
+# ---------- fetch / pull ----------
+
+def net_env(path):
+    """Never prompt (no terminal): ssh in batch mode, keeping the user's own ssh command."""
+    env = dict(GIT_ENV, GIT_ASKPASS="true", SSH_ASKPASS="", SSH_ASKPASS_REQUIRE="never")
+    _, custom, _ = git(path, "config", "--get", "core.sshCommand")
+    ssh = os.environ.get("GIT_SSH_COMMAND") or custom.strip() or "ssh"
+    env["GIT_SSH_COMMAND"] = ssh + " -o BatchMode=yes -o ConnectTimeout=10"
+    return env
+
+
+def cmd_fetch(quiet=False):
+    s = settings()
+    paths = find_repos(s)
+
+    def fetch(p):
+        ok, text, _ = git(p, "remote")
+        if not text.strip():
+            return "skipped"   # no remote to fetch from
+        ok, _, err = git(p, "fetch", "--all", "--prune", "--quiet", timeout=90, env=net_env(p))
+        return "ok" if ok else {"name": os.path.basename(p), "path": p, "error": git_error(err, "fetch failed")}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(fetch, paths))
+    failed = [r for r in results if isinstance(r, dict)]
+    summary = {"fetched": results.count("ok"), "skipped": results.count("skipped"), "failed": failed}
+    if not quiet:
+        if failed:
+            notify(f"Fetched {summary['fetched']} projects, {len(failed)} failed",
+                   "; ".join(f"{f['name']}: {f['error']}" for f in failed[:3]))
+        else:
+            notify(f"Fetched {summary['fetched']} projects")
+    out(listing(s, {"fetch": summary}))
+
+
+def cmd_pull(path):
+    path = check_repo(path)
+    name = os.path.basename(path)
+    st = status(path, settings())
+    if st["detached"] or not st["upstream"] or st["upstreamGone"]:
+        msg = "detached HEAD" if st["detached"] else "the upstream branch is gone" if st["upstreamGone"] else "no upstream branch"
+        notify(f"Not pulling {name}", msg)
+        out({"error": f"Can't pull {name}: {msg}"}, 1)
+    before = git(path, "rev-parse", "HEAD")[1].strip()
+    ok, text, err = git(path, "pull", "--ff-only", timeout=120, env=net_env(path))
+    if ok:
+        n = git(path, "rev-list", "--count", f"{before}..HEAD")[1].strip() if before else ""
+        msg = f"{name}: {n} new commit{'' if n == '1' else 's'}" if n and n != "0" else f"{name} is already up to date"
+    else:
+        msg = git_error(err, "pull failed")
+    notify(f"Pulled {name}" if ok else f"Pull failed: {name}", msg)
+    out({"ok": True, "message": msg} if ok else {"ok": False, "error": msg}, 0 if ok else 1)
+
+
+# ---------- branches ----------
+
+def branches_of(path, count=15):
+    name = os.path.basename(path)
+    ok, current, _ = git(path, "branch", "--show-current")
+    current = current.strip()
+    ok, text, _ = git(path, "for-each-ref", "--sort=-committerdate", f"--count={count}",
+                      "--format=%(refname:short)%09%(committerdate:unix)%09%(upstream:short)%09%(upstream:track,nobracket)",
+                      "refs/heads")
+    out_ = []
+    for line in text.splitlines():
+        b, ts, up, track = (line.split("\t") + ["", "", ""])[:4]
+        out_.append({"repo": name, "path": path, "name": b, "current": b == current,
+                     "at": int(ts) if ts.isdigit() else 0, "upstream": up, "track": track})
+    return out_
+
+
+def cmd_branches(path):
+    path = check_repo(path)
+    out({"path": path, "branches": branches_of(path, 30)})
+
+
+def cmd_switch(path, branch):
+    path = check_repo(path)
+    name = os.path.basename(path)
+
+    def fail(msg, code=1):
+        notify(f"Couldn't switch {name}", msg)
+        out({"ok": False, "error": msg}, code)
+
+    ok, _, _ = git(path, "check-ref-format", "--branch", branch)
+    if not ok or branch.startswith("-"):
+        fail(f"'{branch}' is not a valid branch name", 2)
+    local = git(path, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")[0]
+    if not local:
+        ok, text, _ = git(path, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/*/{branch}")
+        if not text.strip():
+            fail(f"No branch '{branch}' in {name}")
+    st = status(path, settings())
+    if st["error"]:
+        fail(st["error"])
+    if st["branch"] == branch:
+        out({"ok": True, "message": f"Already on {branch}"})
+    if st["staged"] or st["modified"] or st["conflicts"]:
+        fail("It has uncommitted changes — commit or stash them first.")
+    ok, _, err = git(path, "switch", branch, timeout=60)
+    if not ok:
+        fail(git_error(err, "git switch failed"))
+    notify(f"{name}: on {branch}")
+    out({"ok": True, "message": f"Switched {name} to {branch}"})
+
+
+def cmd_extras():
+    s = settings()
+
+    def one(path):
+        name = os.path.basename(path)
+        files, seen = [], set()
+        ok, text, _ = git(path, "status", "--porcelain", "-z")
+        changed, items, i = [], text.split("\0"), 0
+        while i < len(items):
+            item = items[i]
+            if len(item) > 3:
+                changed.append(item[3:])
+                if item[0] in "RC":
+                    i += 1   # -z puts the old name of a rename after the new one
+            i += 1
+        ok, text, _ = git(path, "-c", "core.quotePath=false", "log", "-n", "15", "--name-only", "-z", "--pretty=format:")
+        logged = [f.strip("\n") for f in text.split("\0")]
+        changed_set = set(changed)
+        for f in changed + logged:
+            if not f or f in seen or not os.path.isfile(os.path.join(path, f)):
+                continue
+            seen.add(f)
+            files.append({"repo": name, "path": path, "file": f, "changed": f in changed_set})
+            if len(files) >= 12:
+                break
+        return [{k: b[k] for k in ("repo", "path", "name", "current", "at")} for b in branches_of(path)], files
+
+    branches, files = [], []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for b, f in pool.map(one, find_repos(s)):
+            branches += b
+            files += f
+    out({"branches": branches, "files": files})
+
+
+# ---------- launching ----------
+
+def launch(argv, cwd=None):
+    if not os.path.basename(argv[0]).startswith("omarchy-launch") and shutil.which("uwsm-app"):
+        argv = ["uwsm-app", "--", *argv]
+    subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def terminal_argv(s, path, command=None):
+    """argv for a terminal in `path`, optionally running `command` and then a shell."""
+    spec = os.path.expandvars(str(s.get("terminal") or DEFAULTS["terminal"])).strip()
+    argv = shlex.split(spec) or [DEFAULTS["terminal"]]
+    if not shutil.which(argv[0]):
+        return None, f"Terminal `{argv[0]}` not found — set \"terminal\" in {CONF}"
+    if any("{dir}" in a for a in argv):
+        argv = [a.replace("{dir}", path) for a in argv]
+        before = ["-e"]
+    else:
+        dir_args, before = TERMINALS.get(os.path.basename(argv[0]), ([], ["-e"]))
+        argv += [a.replace("{dir}", path) for a in dir_args]
+    if command:
+        shell = os.environ.get("SHELL") or "bash"
+        argv += before + ["bash", "-lc", f'{command}; exec "{shell}"']
+    return argv, ""
+
+
+def open_editor(path, s):
+    spec = os.path.expandvars(str(s.get("editor") or DEFAULTS["editor"])).strip()
+    argv = shlex.split(spec) or shlex.split(DEFAULTS["editor"])
+    if not shutil.which(argv[0]):
+        return f"Editor `{argv[0]}` not found — set \"editor\" in {CONF}"
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    if os.path.basename(argv[0]) in TUI_EDITORS:
+        term, err = terminal_argv(s, folder, shlex.join([*argv, path]))
+        if err:
+            return err
+        launch(term, cwd=folder)
+    else:
+        launch([*argv, path], cwd=folder)
+    return ""
+
+
+def open_terminal(path, s, command=None):
+    argv, err = terminal_argv(s, path, command)
+    if err:
+        return err
+    launch(argv, cwd=path)
+    return ""
+
+
+def finish(err, ok_obj=None):
+    if err:
+        notify("Projects", err)
+        out({"ok": False, "error": err}, 1)
+    out(ok_obj or {"ok": True})
+
+
+def cmd_open(path):
+    path = check_repo(path)
+    s = settings()
+    err = open_editor(path, s)
+    if not err and s.get("openTerminal", True):
+        err = open_terminal(path, s)
+    finish(err)
+
+
+def cmd_editor(path):
+    path = check_repo(path)
+    finish(open_editor(path, settings()))
+
+
+def cmd_term(path):
+    path = expand(path)
+    if not os.path.isdir(path):
+        out({"error": f"Not a folder: {path}"}, 1)
+    finish(open_terminal(path, settings()))
+
+
+def cmd_dev(path):
+    path = check_repo(path)
+    s = settings()
+    command = dev_command(path, s)
+    if not command:
+        finish(f"No dev command found for {os.path.basename(path)} — add one under \"projects\" in {CONF}")
+    finish(open_terminal(path, s, command), {"ok": True, "command": command})
+
+
+def cmd_settings():
+    if not os.path.exists(CONF):
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+            f.write("\n")
+    finish(open_editor(CONF, settings()), {"ok": True, "path": CONF})
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    cmds1 = {"open": cmd_open, "editor": cmd_editor, "term": cmd_term, "dev": cmd_dev,
+             "branches": cmd_branches, "pull": cmd_pull}
+    if a[:1] == ["list"]:
+        cmd_list()
+    elif a[:1] == ["fetch"] and len(a) <= 2:
+        cmd_fetch(quiet="--quiet" in a)
+    elif len(a) == 2 and a[0] in cmds1:
+        cmds1[a[0]](a[1])
+    elif a[:1] == ["extras"]:
+        cmd_extras()
+    elif a[:1] == ["switch"] and len(a) == 3:
+        cmd_switch(a[1], a[2])
+    elif a[:1] == ["settings"]:
+        cmd_settings()
+    else:
+        print(__doc__)
+        sys.exit(2)

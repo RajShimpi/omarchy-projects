@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.projects",
+  "name": "Projects",
+  "version": "1.1.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "All your git projects in one bar panel: branch, uncommitted changes, commits to push or pull, stashes. Search and sort them, open one in your editor and terminal, start its dev server, switch branch, pull, or fetch everything at once.",
+  "repository": "https://github.com/RajShimpi/omarchy-projects",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Projects",
+    "description": "Git projects with their status: open, run, switch branch",
+    "category": "Development",
+    "aliases": ["git", "repos", "repositories", "branches"],
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
