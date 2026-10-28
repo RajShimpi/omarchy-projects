@@ -247,6 +247,7 @@ Panel {
       color: "#f76b15"
       Text {
         id: attText
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: root.attention > 9 ? "9+" : String(root.attention)
         color: root.bar ? root.bar.background : Commons.Color.background
@@ -285,12 +286,13 @@ Panel {
           Row {
             id: hero
             spacing: Style.space(14)
-            Text { text: root.glyph("git"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
+            Text { textFormat: Text.PlainText; text: root.glyph("git"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
             Column {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
-              Text { text: "Projects"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "Projects"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
               Text {
+                textFormat: Text.PlainText
                 text: (root.repos.length + " repos · " + root.attention + " need attention" + (listProc.running ? " · updating…" : "")).toUpperCase()
                 color: Qt.darker(root.fg, 1.4); font.family: root.font; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2
               }
@@ -376,6 +378,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: root.listError !== ""
           width: parent.width
           wrapMode: Text.Wrap
@@ -384,6 +387,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: root.status !== ""
           width: parent.width
           wrapMode: Text.Wrap
@@ -466,6 +470,7 @@ Panel {
                         spacing: Style.space(8)
                         Text {
                           id: nameText
+                          textFormat: Text.PlainText
                           text: card.r.name
                           color: root.fg; font.family: root.font; font.pixelSize: Style.font.bodySmall; font.bold: true
                           elide: Text.ElideRight
@@ -473,6 +478,7 @@ Panel {
                         }
                         Text {
                           id: branchText
+                          textFormat: Text.PlainText
                           anchors.verticalCenter: parent.verticalCenter
                           text: (card.r.detached ? root.glyph("commit") + " detached @ " + card.r.head : root.glyph("branch") + " " + (card.r.branch || "?"))
                                 + (card.r.unborn || card.r.error ? "" : (card.expanded ? " ▴" : " ▾"))
@@ -491,6 +497,7 @@ Panel {
                         }
                         Text {
                           id: tagText
+                          textFormat: Text.PlainText
                           anchors.verticalCenter: parent.verticalCenter
                           text: (card.r.worktree ? root.glyph("worktree") + " worktree · " : "") + card.r.group
                           color: Qt.darker(root.fg, 1.9); font.family: root.font; font.pixelSize: Style.font.caption
@@ -525,6 +532,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: card.r.unborn ? "no commits yet"
                           : root.ago(card.r.lastCommit) + (card.r.lastSubject ? " · " + card.r.lastSubject : "")
@@ -586,6 +594,7 @@ Panel {
                     bottomPadding: Style.space(2)
 
                     Text {
+                      textFormat: Text.PlainText
                       visible: root.branchList.length === 0
                       text: branchProc.running ? "Loading branches…" : "No local branches"
                       color: Qt.darker(root.fg, 1.6); font.family: root.font; font.pixelSize: Style.font.caption
@@ -605,6 +614,7 @@ Panel {
                       }
                     }
                     Text {
+                      textFormat: Text.PlainText
                       visible: card.r.staged + card.r.modified + card.r.conflicts > 0
                       text: "Commit or stash your changes before switching."
                       color: "#f76b15"; font.family: root.font; font.pixelSize: Style.font.caption
@@ -615,6 +625,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.shown.length === 0
               width: parent.width
               topPadding: Style.space(10)
@@ -628,6 +639,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.shown.length > 0
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
@@ -653,6 +665,7 @@ Panel {
   }
 
   component Chip: Text {
+    textFormat: Text.PlainText
     property string label: ""
     property color tint: root.fg
     width: Math.min(implicitWidth, parent ? parent.width : implicitWidth)

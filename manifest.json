@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "techspawn.projects",
   "name": "Projects",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Raj Shimpi",
   "license": "MIT",
   "description": "All your git projects in one bar panel: branch, uncommitted changes, commits to push or pull, stashes. Search and sort them, open one in your editor and terminal, start its dev server, switch branch, pull, or fetch everything at once.",

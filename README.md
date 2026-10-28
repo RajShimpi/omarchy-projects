@@ -162,6 +162,8 @@ send a desktop notification. `OMARCHY_NO_NOTIFY=1` prints them instead, and
 - Fetch and pull run ssh in batch mode with a 10 s connection timeout (your
   own `core.sshCommand` is kept) and never wait for a password: repos that
   need one are reported as failed. Credential helpers still work.
+- Repo names, branches and commit subjects are shown as plain text, so
+  markup in a commit message is never rendered or loaded.
 - Nothing is sent anywhere.
 
 ## License
