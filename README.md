@@ -64,9 +64,12 @@ The filter box has the focus when the panel opens:
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/RajShimpi/omarchy-projects
-omarchy bar put techspawn.projects
+omarchy plugin add https://github.com/RajShimpi/omarchy-projects --enable
 ```
+
+That one command is the whole install: enabling puts the widget on the left of
+the bar (its default section). No extra setup is needed. To move it later:
+`omarchy bar move techspawn.projects --section <section>`.
 
 You can also use **Install plugin** in the Omarchy menu with the repository URL.
 
